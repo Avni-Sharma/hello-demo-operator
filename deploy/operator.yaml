@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-demo-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: hello-demo-operator
+  template:
+    metadata:
+      labels:
+        name: hello-demo-operator
+    spec:
+      serviceAccountName: hello-demo-operator
+      containers:
+        - name: hello-demo-operator
+          # Replace this with the built image name
+          image: REPLACE_IMAGE
+          command:
+          - hello-demo-operator
+          imagePullPolicy: Always
+          env:
+            - name: WATCH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPERATOR_NAME
+              value: "hello-demo-operator"
