@@ -2,6 +2,7 @@ package hello
 
 import (
 	"context"
+	"reflect"
 
 	hellov1alpha1 "github.com/Avni-Sharma/hello-demo-operator/pkg/apis/hello/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	appsv1 "k8s.io/api/apps/v1"
 )
 
 var log = logf.Log.WithName("controller_hello")
@@ -100,54 +103,113 @@ func (r *ReconcileHello) Reconcile(request reconcile.Request) (reconcile.Result,
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
-
-	// Set Hello instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
+	// Check if the deployment already exists, if not create a new one
+	found := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+		// Define a new deployment
+		dep := r.deploymentForHello(instance)
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		err = r.client.Create(context.TODO(), dep)
 		if err != nil {
+			reqLogger.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 			return reconcile.Result{}, err
 		}
-
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
+		// Deployment created successfully - return and requeue
+		return reconcile.Result{Requeue: true}, nil
 	} else if err != nil {
+		reqLogger.Error(err, "Failed to get Deployment")
 		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	// Ensure the deployment size is the same as the spec
+	size := instance.Spec.Size
+	if *found.Spec.Replicas != size {
+		found.Spec.Replicas = &size
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return reconcile.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// Update the Hello status with the pod names
+	// List the pods for this hello's deployment
+	podList := &corev1.PodList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(labelsForHello(instance.Name)),
+	}
+	if err = r.client.List(context.TODO(), podList, listOpts...); err != nil {
+		reqLogger.Error(err, "Failed to list pods", "Hello.Namespace", instance.Namespace, "Hello.Name", instance.Name)
+		return reconcile.Result{}, err
+	}
+	podNames := getPodNames(podList.Items)
+
+	// Update status.Nodes if needed
+	if !reflect.DeepEqual(podNames, instance.Status.Nodes) {
+		instance.Status.Nodes = podNames
+		err := r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update hello status")
+			return reconcile.Result{}, err
+		}
+	}
+
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *hellov1alpha1.Hello) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
-	}
-	return &corev1.Pod{
+// deploymentForHello returns a hello Deployment object
+func (r *ReconcileHello) deploymentForHello(m *hellov1alpha1.Hello) *appsv1.Deployment {
+	ls := labelsForHello(m.Name)
+	replicas := m.Spec.Size
+
+	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
+			Name:      m.Name,
+			Namespace: m.Namespace,
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: ls,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: ls,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image:   "memcached:1.4.36-alpine",
+						Name:    "memcached",
+						Command: []string{"memcached", "-m=64", "-o", "modern", "-v"},
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: 11211,
+							Name:          "memcached",
+						}},
+					}},
 				},
 			},
 		},
 	}
+	// Set Hello instance as the owner and controller
+	controllerutil.SetControllerReference(m, dep, r.scheme)
+	return dep
+}
+
+// labelsForHello returns the labels for selecting the resources
+// belonging to the given hello CR name.
+func labelsForHello(name string) map[string]string {
+	return map[string]string{"app": "hello", "hello_cr": name}
+}
+
+// getPodNames returns the pod names of the array of pods passed in
+func getPodNames(pods []corev1.Pod) []string {
+	var podNames []string
+	for _, pod := range pods {
+		podNames = append(podNames, pod.Name)
+	}
+	return podNames
 }
